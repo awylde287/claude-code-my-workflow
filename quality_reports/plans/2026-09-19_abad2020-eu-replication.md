@@ -8,8 +8,10 @@ The dynamics of split ratings.* J. Int. Financ. Markets Inst. Money 68, 101239.
 
 **Basis.** The full paper was read (13 pages, all tables). Three of the four data files were profiled
 directly (`FR Bond List.xlsx`, `Historical_Ratings_Datset.csv`, `Treasury_Match_Final.xlsx`).
-`Bond_Time_Series_Dataset copy.csv` was **not** in the push and has not been seen; everything that
-depends on it is marked **[TS]** and rests on the description in the treasury workbook's notes.
+`Bond_Time_Series_Dataset copy.csv` (791 MB) stays on your machine; its header, first and last rows
+and line count were supplied by you, so its schema is known but its coverage (date range per bond,
+missing prices, zero-return share) is not. Items that still depend on that coverage are marked
+**[TS-coverage]** and are the first thing module M0 measures.
 
 ---
 
@@ -96,10 +98,24 @@ two variables you said you lack is a blocker.
   and mention a separate **price file**, an **excess-return file** and an **FX file** that are not in
   the repo.
 
-### 2.4 `Bond_Time_Series_Dataset copy.csv` — **not received** [TS]
-From the notes it is a bond × day panel of about 11M rows. Needed on day one. If it is over
-GitHub's 100 MB limit, gzip it (`gzip -k`), or push a `head -n 200000` sample plus the column list
-so the schema can be fixed while the full pull is arranged.
+### 2.4 `Bond_Time_Series_Dataset copy.csv` — 5,436,595 rows × 22 columns, 791 MB (schema from your `head`/`tail`)
+- **Long format, one row per `ric` × `date`**, sorted by bond then date (first block is a 2024 issue,
+  last block runs to 2026-06-05). Rough coverage: ~1,200 bond-days per bond on average.
+- **Join key is `ric`, not ISIN.** The bond list's `Preferred RIC` and the workbook's
+  `treasury_at_event.ric` use the same key. Most RICs are `<ISIN>=`, but not all (`IE299129675=` is
+  the Tyco XS2991296752 bond), so join on RIC and never reconstruct an ISIN from the RIC string.
+- Price fields: `Bid Price`, `Ask Price`, `Mid Price` — Refinitiv **quoted clean prices**, which is
+  what Eq. (2) wants (the paper deliberately uses clean prices). No trades, no volume.
+- Extra analytics the paper does not have: `Option Adjusted Spread Bid`, `Z Spread`,
+  `Modified Duration`, `Yield to Maturity` (empty in the early rows of at least one bond).
+- Static fields repeated on every row (`issuer`, `seniority`, `issue_date`, `maturity_date`,
+  `principal_currency`, `putable`, `callable_flag`, `guaranteed`, `perpetual`, `exchange_name`,
+  `has_warrants`, `cusip`, `group`) duplicate the bond list; drop them on load and take statics from
+  `bonds.rds` so there is one source of truth.
+- Handling: too large for GitHub (100 MB cap) and for Excel. Keep it local, read once with
+  `data.table::fread(select = c("date","ric","Bid Price","Ask Price","Mid Price","Z Spread",
+  "Modified Duration","Yield to Maturity"))` or `arrow::open_csv_dataset`, and write it to Parquet
+  partitioned by year (`data/panel/year=YYYY/`). Every later module reads the Parquet, never the CSV.
 
 ---
 
@@ -111,8 +127,8 @@ so the schema can be fixed while the full pull is arranged.
 | D2 | Issue-level ratings (Mergent) | Issuer-level ratings | **Attach each issuer's senior-unsecured (fallback: LT issuer) rating per agency to every bond of that issuer.** Bonds with `Seniority Type` ≠ SR/UN/SRSEC-with-no-secured-rating inherit only if the agency has no matching seniority series. One issuer downgrade → one bond-event per priced bond. Cluster SE by issuer-event (the paper uses issuer dummies plus robust SE; add clustering as robustness). |
 | D3 | US Treasury zero curve, USD bonds | 66% EUR, plus CHF/GBP/NOK/SEK; benchmark built on the **US** curve | **Benchmark in the bond's own currency: ECB euro-area AAA Svensson curve for EUR (daily parameters published since 2004-09-06), BoE nominal zero curve for GBP, SNB for CHF; drop or robustness-only for NOK/SEK/HUF/CZK/ISK/PLN.** The paper subtracts the Treasury return to remove *risk-free rate moves in the bond's own market*; a USD curve leaves euro rate moves inside the "excess" return and adds USD rate noise. Keep the existing US-curve version as a robustness column since it is already built. **This overturns a choice attributed to Maylis; raise it with them before building.** |
 | D4 | Excludes callable bonds (fn. 8) | 52% callable | **Primary sample keeps callable bonds and adds a `Callable` control; robustness re-runs on non-callable only.** Most post-2010 European IG bonds carry make-whole or 3-month par calls that are not economically meaningful optionality; excluding them halves the sample and skews it to older IG issues. If Refinitiv gives call type, exclude only genuine (non-make-whole) callables. |
-| D5 | 4 traded prices between events | Quoted / evaluated prices [TS] | **Replace with a staleness filter:** require price *changes* on ≥ 4 distinct days between consecutive events, and drop bonds whose share of zero-return days over the prior 60 days exceeds a cut set after inspecting the distribution. |
-| D6 | t1 = last trade before, t2 = first trade after | Daily quotes [TS] | With quotes, t1 = day −1 and t2 = day 0 or +1 for nearly all events, so `W` will be nearly constant. **Keep Eq. (2) exactly as the primary ER; add a fixed (−1, +1) and (−1, +5) window as robustness.** Confirm from the vendor whether the quote is end-of-day; an announcement after the close belongs to day +1. |
+| D5 | 4 traded prices between events | Quoted bid/ask/mid, no trades | **Replace with a staleness filter on the mid price:** require mid-price *changes* on ≥ 4 distinct days between consecutive events of the same bond, and drop bond-events whose share of zero-return days over the prior 60 quoted days exceeds a cut set after inspecting the distribution [TS-coverage]. Use `Ask − Bid` (relative to mid) as a liquidity control in Panel B; the paper has no such control, so report it as an addition. |
+| D6 | t1 = last trade before, t2 = first trade after | Daily quotes | With daily quotes, t1 = day −1 and t2 = day 0 or +1 for nearly every event, so `W` is almost constant and its coefficient will not be identified as in the paper. **Keep Eq. (2) as the primary ER on `Mid Price`; add fixed (−1, +1) and (−1, +5) windows and a `Bid Price` version as robustness.** Confirm with Refinitiv whether quotes are end-of-day; an announcement after the close belongs to day +1. |
 | D7 | Covenants, Risk (Moody's AAA index) | No covenant field; no index series | Covenants: **drop** (state in ledger) unless Refinitiv exports it. Risk: **use the daily change in the ICE BofA / iBoxx Euro AAA corporate yield** (or the ECB AAA sovereign 10y as a fallback). |
 | D8 | Volume issued | `Amount Issued (EUR)` | Same variable; use log amount. |
 | D9 | 2004–2014, 16,625 events | ~2007–2025, ~750–1,500 downgrades (issuer level), bond-level larger | **Sample = all priced years; report 2008–2025.** Period dummies: replace NBER phases with **CEPR euro-area cycle dates** plus a COVID dummy (2020 holds 10% of downgrades). Power: the HY × narrow cell has ~120 issuer-events; multiply by bonds per issuer, but expect Table 6's HY coefficients to have wide intervals. |
@@ -145,10 +161,14 @@ All code under `explorations/abad2020_eu/` (repo sandbox protocol), R with `data
 Raw files are never edited. Move the four raw files out of the repo root into
 `explorations/abad2020_eu/data/raw/` — the hygiene gate already flags all four at root.
 
-### M0 `00_inventory.R` — freeze the facts in §2 as a script
-Re-runs the profiling above from the raw files and writes `output/inventory.md`. When the time
-series arrives, extend it with: long vs wide shape, price field (clean / dirty / bid / ask / mid),
-frequency, date range, share of zero-return days per bond, and the ISIN overlap with the bond list.
+### M0 `00_inventory.R` — freeze the facts in §2 as a script, and convert the time series
+Re-runs the profiling above from the raw files and writes `output/inventory.md`. For the time
+series it (a) converts the CSV to year-partitioned Parquet once, then (b) measures what is still
+unknown [TS-coverage]: first and last quoted date per RIC, quoted days per RIC, gaps longer than
+five business days, share of missing `Mid Price`, share of zero-return days per RIC, `Ask − Bid`
+distribution, and the RIC overlap with `bonds.rds` (expect close to 4,546) and with
+`treasury_at_event`. Output: `output/ts_coverage.csv`, one row per RIC. The go/no-go for bond-level
+power reads off this file: bonds quoted on their issuer's downgrade dates.
 
 ### M1 `01_bonds.R` — bond universe
 - Parse dates, coupon, `amount_eur` (numeric; 23 failures to inspect), `callable`, `perpetual`,
@@ -182,10 +202,11 @@ frequency, date range, share of zero-return days per bond, and the ISIN overlap 
   only-here / only-there with the reason for each unmatched row.
 - Output: `events_issuer.rds`, `events_bond.rds`, `output/event_reconciliation.md`.
 
-### M4 `04_prices_and_er.R` — returns and excess returns **[TS]**
-- Reshape to long if wide; one row per ISIN-date; keep clean price (paper uses clean; if only dirty
-  is available, strip accrued from coupon, frequency and day count and validate on ten bonds).
-- Staleness diagnostics and the D5 filter.
+### M4 `04_prices_and_er.R` — returns and excess returns
+- Read the Parquet panel; key = (`ric`, `date`); join `bonds.rds` on `Preferred RIC` to get ISIN,
+  currency, maturity and statics. Price = `Mid Price` (clean, as the paper); keep `Bid Price`,
+  `Ask Price`, `Z Spread`, `Modified Duration` for robustness and for the liquidity control.
+- Drop rows with missing mid; log per-RIC counts. Staleness diagnostics and the D5 filter.
 - Benchmark price: for each bond-day, remaining maturity `n` in years and the own-currency zero
   yield `y(n)` from the currency's Svensson parameters (ECB for EUR; the workbook's GSW for the US
   robustness); `T = exp(−y/100 × n)`. Note the paper's `T` is a *price*, so `(T_t2 − T_t1)/T_t1`
@@ -237,8 +258,10 @@ No duplicate keys; every bond-event date inside the bond's priced range; narrow 
 ## 6. Feasibility and power
 
 - Issuer-level: ~1,216 downgrades with a split defined, 446 narrow. HY with split: 385, of which
-  122 narrow. Bond-level multiplies by outstanding priced bonds per issuer (median unknown until
-  [TS]; the bond list averages 3.8 bonds per issuer, 5–15 for large issuers).
+  122 narrow. Bond-level multiplies by bonds of the issuer that are *quoted on the event date*;
+  the bond list averages 3.8 bonds per issuer, but quote coverage per bond-date is the unknown
+  that `output/ts_coverage.csv` settles [TS-coverage]. The `treasury_at_event` sheet's 748
+  downgrades across 557 RICs is a lower bound on what the previous build found priced.
 - The paper's Table 4 effects are detectable at these sizes; Table 6 HY effects will be estimated
   with wide intervals. Say so in the write-up rather than pooling until something is significant.
 - **Preregister the three acceptance-test claims before running M7** (`/preregister`); with a
@@ -253,7 +276,8 @@ No duplicate keys; every bond-event date inside the bond's priced range; narrow 
 | Events | downgrades + negative watch | downgrades only | no watch history in the ratings export |
 | Scale | 58-point | 22-notch | no watch; ×3 conversion stated |
 | Rating level | issue | issuer senior-unsecured / LT issuer | export is issuer-level |
-| Market | US, USD, TRACE trades | Europe, EUR/GBP/CHF, quoted prices [TS] | design of the study |
+| Market | US, USD, TRACE trades | Europe, EUR/GBP/CHF, Refinitiv quoted mid prices | design of the study |
+| Liquidity control | none (trade filter) | relative bid–ask spread in Panel B | quotes carry a spread, not a trade count |
 | Benchmark | US Treasury zero curve | own-currency sovereign zero curve; US as robustness | D3 |
 | Callable | excluded | included with control; excluded in robustness | D4 |
 | Liquidity filter | 4 trades between events | staleness filter | quotes, not trades |
@@ -268,18 +292,19 @@ No duplicate keys; every bond-event date inside the bond's priced range; narrow 
 
 | Step | Effort | Blocked by |
 |---|---|---|
-| Push the time series; move raw files under `explorations/abad2020_eu/data/raw/` | 0.5 h | — |
+| Convert the 791 MB CSV to Parquet locally (do **not** push it); move the other raw files under `explorations/abad2020_eu/data/raw/` and gitignore `data/` | 1 h | — |
 | Decide D3 (benchmark currency) and D4 (callable) with your supervisor | a conversation | — |
 | M0, M1, M2 | 1.5 days | — |
 | M3 + reconciliation with the 1,265 prebuilt events | 1 day | M2 |
 | Pull ECB AAA Svensson parameters (and BoE/SNB curves if GBP/CHF stay in) | 0.5 day | D3 |
-| M4, M4b | 2 days | time series [TS], M3 |
+| M4, M4b | 2 days | M0 Parquet, M3 |
 | M5, M6 | 1 day | M4 |
 | M7, M8 | 1.5 days | M4b |
 | M9 + write-up | 1–2 days | M7, M8 |
 
-**Longest-lead item:** the time-series file. **Highest-stakes decision:** D3, because every ER in
-every table depends on it and the version already built uses the other choice.
+**Longest-lead item:** the ECB/BoE/SNB curve parameters if D3 goes the own-currency way.
+**Highest-stakes decision:** D3, because every ER in every table depends on it and the version
+already built uses the other choice.
 
 ---
 

@@ -117,6 +117,12 @@ two variables you said you lack is a blocker.
   "Modified Duration","Yield to Maturity"))` or `arrow::open_csv_dataset`, and write it to Parquet
   partitioned by year (`data/panel/year=YYYY/`). Every later module reads the Parquet, never the CSV.
 
+### 2.5 `Exchange-Rates.xlsx` — daily FX, local units per USD (on `main`, not yet on this branch)
+- Sheets `rates_wide` / `rates_long` (1970–2026, EUR GBP CHF NOK SEK HUF CZK PLN ISK), `rates_from_oldest_bond`
+  (blank before each currency's first non-perpetual bond), `coverage` (notes: pre-1999 EUR is a
+  synthetic ECU series; residual weekend quotes pre-1990). Quoting: `USD = local / rate`.
+- Role in this plan: the USD-common-currency robustness column of D3, and nothing in the main
+  tables. Amounts are already in EUR in the bond list. Move it under `data/raw/` with the others.
 ---
 
 ## 3. Gap analysis and the decisions it forces
@@ -124,8 +130,8 @@ two variables you said you lack is a blocker.
 | # | Paper | Your data | Decision (recommended in bold) |
 |---|---|---|---|
 | D1 | Events = downgrades + negative watch, 58-pt scale | No watch history | **Events = downgrades only, on a 22-notch scale (AAA = 22 … D/SD = 1).** ΔCR in notches; the paper's 3 points = 1 notch, so coefficients on ΔCR/Split rescale by ×3 when compared. Record in the deviation ledger. Outlook changes are *not* events (the paper does not use outlook either). |
-| D2 | Issue-level ratings (Mergent) | Issuer-level ratings | **Attach each issuer's senior-unsecured (fallback: LT issuer) rating per agency to every bond of that issuer.** Bonds with `Seniority Type` ≠ SR/UN/SRSEC-with-no-secured-rating inherit only if the agency has no matching seniority series. One issuer downgrade → one bond-event per priced bond. Cluster SE by issuer-event (the paper uses issuer dummies plus robust SE; add clustering as robustness). |
-| D3 | US Treasury zero curve, USD bonds | 66% EUR, plus CHF/GBP/NOK/SEK; benchmark built on the **US** curve | **Benchmark in the bond's own currency: ECB euro-area AAA Svensson curve for EUR (daily parameters published since 2004-09-06), BoE nominal zero curve for GBP, SNB for CHF; drop or robustness-only for NOK/SEK/HUF/CZK/ISK/PLN.** The paper subtracts the Treasury return to remove *risk-free rate moves in the bond's own market*; a USD curve leaves euro rate moves inside the "excess" return and adds USD rate noise. Keep the existing US-curve version as a robustness column since it is already built. **This overturns a choice attributed to Maylis; raise it with them before building.** |
+| D2 | Issue-level ratings (Mergent) | Issuer-level ratings, one series per seniority class and agency | **Owner's rule (2026-09-19): match each bond to the agency's rating series of the same seniority class.** Measured coverage of that rule on the 3,390 bonds with a Big-Three-rated issuer: S&P 2,641 / 2,991 exact, Moody's 2,456 / 2,815, Fitch 1,756 / 1,942 (88–90%). Fallback ladder (§5 M2) lifts it to 99%. One issuer-seniority downgrade → one bond-event per priced bond of that class. Cluster SE by issuer-event as robustness. |
+| D3 | US Treasury zero curve, USD bonds | 66% EUR, plus CHF/GBP/NOK/SEK; benchmark built on the **US** curve; daily FX rates now available (§2.5) | **Benchmark in the bond's own currency: ECB euro-area AAA Svensson curve for EUR (daily parameters since 2004-09-06, same formula as the workbook's GSW code, so only the parameters change), BoE nominal spot curve for GBP, SNB Confederation spot rates for CHF (together 86% of bonds); NOK/SEK/HUF/CZK/ISK/PLN robustness-only.** The paper subtracts the Treasury return to strip *risk-free rate moves in the bond's own market*. **The FX file does not substitute for this:** converting a EUR bond's return to USD and subtracting the US zero return leaves the euro rate move inside the "excess" return and adds the EUR/USD move on top (daily s.d. ≈ 0.5%, the same order as the price response to a one-notch downgrade). Keep the US-curve version, in local currency and in USD via the FX file, as two robustness columns. **Decide it with data (M4b):** on non-event days regress daily bond price changes on the own-currency zero-price change and on the US zero-price change; the benchmark with the higher R² is the right one. Raise with Maylis with that table in hand. |
 | D4 | Excludes callable bonds (fn. 8) | 52% callable | **Primary sample keeps callable bonds and adds a `Callable` control; robustness re-runs on non-callable only.** Most post-2010 European IG bonds carry make-whole or 3-month par calls that are not economically meaningful optionality; excluding them halves the sample and skews it to older IG issues. If Refinitiv gives call type, exclude only genuine (non-make-whole) callables. |
 | D5 | 4 traded prices between events | Quoted bid/ask/mid, no trades | **Replace with a staleness filter on the mid price:** require mid-price *changes* on ≥ 4 distinct days between consecutive events of the same bond, and drop bond-events whose share of zero-return days over the prior 60 quoted days exceeds a cut set after inspecting the distribution [TS-coverage]. Use `Ask − Bid` (relative to mid) as a liquidity control in Panel B; the paper has no such control, so report it as an addition. |
 | D6 | t1 = last trade before, t2 = first trade after | Daily quotes | With daily quotes, t1 = day −1 and t2 = day 0 or +1 for nearly every event, so `W` is almost constant and its coefficient will not be identified as in the paper. **Keep Eq. (2) as the primary ER on `Mid Price`; add fixed (−1, +1) and (−1, +5) windows and a `Bid Price` version as robustness.** Confirm with Refinitiv whether quotes are end-of-day; an announcement after the close belongs to day +1. |
@@ -179,10 +185,28 @@ power reads off this file: bonds quoted on their issuer's downgrade dates.
   sample; issue date sane (drop the 1900 placeholders or fix them from the vendor).
 - Output: `bonds.rds`, one row per ISIN.
 
-### M2 `02_ratings.R` — issuer × agency rating history
-- Drop `Market` duplicates; keep Big Three; keep LT senior-unsecured series (`SSU`/`MSU`/`FSU`),
-  fall back to LT issuer (`SPI`/`MIS`/`FDL`) when an issuer-agency has no senior-unsecured series.
-  Write the choice per issuer-agency to `output/rating_series_choice.csv`.
+### M2 `02_ratings.R` — issuer × agency × seniority-class rating history
+- Keep Big Three. Classify every `Seniority` label into a class and drop the non-ratings:
+
+  | Class | Ratings-file labels (codes) | Bond-list `Seniority Type` it serves |
+  |---|---|---|
+  | sr_unsecured | Senior Unsecured (SSU/MSU/FSU), LT Senior Unsecured MTN (SMU/MMU/FMU), Backed Senior Unsecured (MBU/FBU) for guaranteed bonds | SR, SRP; fallback for UN |
+  | sr_secured | Senior Secured (SSE/MSE/FSE), Backed Senior Secured (MBE), first mortgage / first lien | SRSEC, 1STLIEN, MTG, 1STMTG |
+  | secured | (no series in the export) | SEC, 2NDLIEN → fall back to sr_secured, then sr_unsecured |
+  | sub / jr_sub | Subordinated (SBD/MBD/FBD), Junior Subordinated (SJB/MJB) | SUB, SRSUB |
+  | issuer | LT Issuer (SPI/MIS/FIS), LT Issuer Default (FDL), Derived LT Issuer (MDL) | last-resort fallback for any class |
+  | drop | LGD*, Probability of Default, Corporate Family, Baseline Credit Assessment, Speculative Grade Liquidity, all short-term, national scale, support ratings | — |
+
+- **Matching ladder per bond × agency:** (1) same class, `Backed` variant if `Guaranteed = Yes`
+  (414 of 527 guaranteed bonds have one); (2) sr_unsecured; (3) issuer. Record which rung was used
+  in `output/rating_series_choice.csv` and report the rung as a column in Table 2; run Table 4 on
+  rung-1 bonds only as a robustness.
+- **`Market` is not a duplicate flag:** 612 of 2,468 issuer-agency-code series exist in both
+  Foreign and Domestic with different histories. Pick by the bond's `Market of Issue`
+  (Eurobond / Foreign / Global → Foreign; Domestic → Domestic); when only the other exists use it;
+  when both exist and disagree on the event date, log the case.
+- If an MTN series and a plain senior-unsecured series both exist for the same issuer-agency, use
+  the plain one unless the bond is identifiably an MTN issue, and log disagreements.
 - Clean strings: strip `(P)`, `*`, `**`, `(EXP)`, `u`, `e` into flags; map to the 22-notch scale;
   `WR`/`NR`/`WD` end coverage (not a downgrade). Write the mapping table to disk.
 - Build the **daily state** table: issuer × agency × date, rating carried forward until the next
@@ -275,7 +299,7 @@ No duplicate keys; every bond-event date inside the bond's priced range; narrow 
 |---|---|---|---|
 | Events | downgrades + negative watch | downgrades only | no watch history in the ratings export |
 | Scale | 58-point | 22-notch | no watch; ×3 conversion stated |
-| Rating level | issue | issuer senior-unsecured / LT issuer | export is issuer-level |
+| Rating level | issue | issuer × seniority-class series, fallback ladder | export is issuer-level by seniority |
 | Market | US, USD, TRACE trades | Europe, EUR/GBP/CHF, Refinitiv quoted mid prices | design of the study |
 | Liquidity control | none (trade filter) | relative bid–ask spread in Panel B | quotes carry a spread, not a trade count |
 | Benchmark | US Treasury zero curve | own-currency sovereign zero curve; US as robustness | D3 |
@@ -292,11 +316,11 @@ No duplicate keys; every bond-event date inside the bond's priced range; narrow 
 
 | Step | Effort | Blocked by |
 |---|---|---|
-| Convert the 791 MB CSV to Parquet locally (do **not** push it); move the other raw files under `explorations/abad2020_eu/data/raw/` and gitignore `data/` | 1 h | — |
-| Decide D3 (benchmark currency) and D4 (callable) with your supervisor | a conversation | — |
+| Convert the 791 MB CSV to Parquet locally (do **not** push it); move the other raw files, including `Exchange-Rates.xlsx` from `main`, under `explorations/abad2020_eu/data/raw/` and gitignore `data/` | 1 h | — |
+| Decide D4 (callable) with your supervisor; D3 is settled by the M4b benchmark test, then confirmed with Maylis | a conversation | — |
 | M0, M1, M2 | 1.5 days | — |
 | M3 + reconciliation with the 1,265 prebuilt events | 1 day | M2 |
-| Pull ECB AAA Svensson parameters (and BoE/SNB curves if GBP/CHF stay in) | 0.5 day | D3 |
+| Pull ECB AAA Svensson parameters, BoE spot curve, SNB spot rates; run the M4b benchmark test | 0.5 day | — |
 | M4, M4b | 2 days | M0 Parquet, M3 |
 | M5, M6 | 1 day | M4 |
 | M7, M8 | 1.5 days | M4b |
